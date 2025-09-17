@@ -1,14 +1,15 @@
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
-const mysql = require('mysql2/promise');
 const cors = require('cors');
-const helmet = require('helmet');
+const mysql = require('mysql2/promise');
+const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const server = http.createServer(app);
+
+// CORS setup for your frontend
 const io = socketIo(server, {
   cors: {
     origin: "*",
@@ -18,23 +19,17 @@ const io = socketIo(server, {
 });
 
 // Middleware
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginEmbedderPolicy: false
-}));
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.static('public'));
+app.use(express.json());
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: 'Too many requests, please try again later'
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
 });
-app.use('/api', limiter);
+app.use(limiter);
 
-// MySQL Connection
+// Database configuration
 const dbConfig = {
   host: 'cashearnersofficial.xyz',
   user: 'cztldhwx_Auto_PostTg',
@@ -42,440 +37,496 @@ const dbConfig = {
   database: 'cztldhwx_Auto_PostTg',
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0,
-  acquireTimeout: 60000,
-  timeout: 60000,
-  reconnect: true
+  queueLimit: 0
 };
 
-let db;
+let dbPool;
 
-// Initialize Database
-async function initDB() {
+// Initialize database pool
+async function initDatabase() {
   try {
-    db = mysql.createPool(dbConfig);
+    dbPool = mysql.createPool(dbConfig);
     
-    // Create tables if not exist
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS math_players (
-        id VARCHAR(36) PRIMARY KEY,
-        username VARCHAR(50) NOT NULL,
-        total_games INT DEFAULT 0,
-        wins INT DEFAULT 0,
-        losses INT DEFAULT 0,
+    // Create tables if they don't exist
+    await dbPool.execute(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        games_played INT DEFAULT 0,
+        games_won INT DEFAULT 0,
         total_score INT DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS math_matches (
-        id VARCHAR(36) PRIMARY KEY,
-        player1_id VARCHAR(36),
-        player2_id VARCHAR(36),
+    await dbPool.execute(`
+      CREATE TABLE IF NOT EXISTS matches (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        player1_id INT,
+        player2_id INT,
         player1_score INT DEFAULT 0,
         player2_score INT DEFAULT 0,
-        winner_id VARCHAR(36),
-        match_duration INT DEFAULT 120,
+        winner_id INT,
+        match_duration INT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (player1_id) REFERENCES math_players(id),
-        FOREIGN KEY (player2_id) REFERENCES math_players(id)
+        FOREIGN KEY (player1_id) REFERENCES users(id),
+        FOREIGN KEY (player2_id) REFERENCES users(id),
+        FOREIGN KEY (winner_id) REFERENCES users(id)
       )
     `);
 
     console.log('✅ Database connected and tables created');
   } catch (error) {
-    console.error('❌ Database connection error:', error);
+    console.error('❌ Database connection failed:', error);
   }
 }
 
-initDB();
+// Game state management
+const gameRooms = new Map();
+const waitingQueue = [];
+const playerSockets = new Map();
 
-// Game State Management
-const waitingQueue = new Map(); // playerId -> playerData
-const activeMatches = new Map(); // matchId -> matchData
-const playerSockets = new Map(); // playerId -> socketId
+// JWT secret (use environment variable in production)
+const JWT_SECRET = process.env.JWT_SECRET || 'mathbattle_secret_2025';
 
-// Utility Functions
-function generateMathQuestion() {
-  const num1 = Math.floor(Math.random() * 90) + 10; // 10-99
-  const num2 = Math.floor(Math.random() * 90) + 10; // 10-99
-  const operators = ['+', '-', '*'];
-  const operator = operators[Math.floor(Math.random() * operators.length)];
+// Utility functions
+function generateQuestion() {
+  const num1 = Math.floor(Math.random() * 89) + 10; // 10-98
+  const num2 = Math.floor(Math.random() * 89) + 10; // 10-98
+  const correctAnswer = num1 + num2;
   
-  let answer;
-  switch(operator) {
-    case '+': answer = num1 + num2; break;
-    case '-': answer = num1 - num2; break;
-    case '*': answer = num1 * num2; break;
-  }
+  const options = [correctAnswer];
   
   // Generate 3 wrong options
-  const options = [answer];
-  while(options.length < 4) {
-    let wrongAnswer;
-    if(operator === '*') {
-      wrongAnswer = answer + Math.floor(Math.random() * 20) - 10;
-    } else {
-      wrongAnswer = answer + Math.floor(Math.random() * 50) - 25;
-    }
-    if(!options.includes(wrongAnswer) && wrongAnswer > 0) {
+  while (options.length < 4) {
+    const wrongAnswer = correctAnswer + Math.floor(Math.random() * 20) - 10;
+    if (wrongAnswer > 0 && wrongAnswer !== correctAnswer && !options.includes(wrongAnswer)) {
       options.push(wrongAnswer);
     }
   }
   
   // Shuffle options
-  for(let i = options.length - 1; i > 0; i--) {
+  for (let i = options.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [options[i], options[j]] = [options[j], options[i]];
   }
   
   return {
-    question: `${num1} ${operator} ${num2}`,
-    options: options,
-    correct: answer,
-    correctIndex: options.indexOf(answer)
+    id: Date.now(),
+    question: `${num1} + ${num2} = ?`,
+    options,
+    correctAnswer,
+    timeLimit: 30
   };
 }
 
-async function createOrUpdatePlayer(playerId, username) {
-  try {
-    const [existing] = await db.execute('SELECT * FROM math_players WHERE id = ?', [playerId]);
-    
-    if(existing.length === 0) {
-      await db.execute(
-        'INSERT INTO math_players (id, username) VALUES (?, ?)',
-        [playerId, username]
-      );
-    } else {
-      await db.execute(
-        'UPDATE math_players SET username = ? WHERE id = ?',
-        [username, playerId]
-      );
-    }
-  } catch(error) {
-    console.error('Database error:', error);
-  }
+function createGameRoom(player1Socket, player2Socket) {
+  const roomId = `room_${Date.now()}`;
+  const gameState = {
+    roomId,
+    players: {
+      [player1Socket.id]: {
+        socket: player1Socket,
+        userId: player1Socket.userId,
+        username: player1Socket.username,
+        score: 0,
+        currentQuestion: null,
+        answered: false,
+        ready: false
+      },
+      [player2Socket.id]: {
+        socket: player2Socket,
+        userId: player2Socket.userId,
+        username: player2Socket.username,
+        score: 0,
+        currentQuestion: null,
+        answered: false,
+        ready: false
+      }
+    },
+    gameStarted: false,
+    gameEnded: false,
+    startTime: null,
+    duration: 120, // 2 minutes
+    timer: null
+  };
+  
+  gameRooms.set(roomId, gameState);
+  
+  // Join both players to the room
+  player1Socket.join(roomId);
+  player2Socket.join(roomId);
+  player1Socket.roomId = roomId;
+  player2Socket.roomId = roomId;
+  
+  return gameState;
 }
 
-async function updatePlayerStats(playerId, won, score) {
+async function saveMatchResult(gameState) {
   try {
-    if(won) {
-      await db.execute(
-        'UPDATE math_players SET total_games = total_games + 1, wins = wins + 1, total_score = total_score + ? WHERE id = ?',
-        [score, playerId]
-      );
-    } else {
-      await db.execute(
-        'UPDATE math_players SET total_games = total_games + 1, losses = losses + 1, total_score = total_score + ? WHERE id = ?',
-        [score, playerId]
-      );
+    const players = Object.values(gameState.players);
+    const player1 = players[0];
+    const player2 = players[1];
+    
+    const winner = player1.score > player2.score ? player1 : 
+                   player2.score > player1.score ? player2 : null;
+    
+    const matchDuration = gameState.startTime ? 
+      Math.floor((Date.now() - gameState.startTime) / 1000) : 0;
+    
+    // Insert match record
+    await dbPool.execute(`
+      INSERT INTO matches (player1_id, player2_id, player1_score, player2_score, winner_id, match_duration)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [
+      player1.userId,
+      player2.userId,
+      player1.score,
+      player2.score,
+      winner ? winner.userId : null,
+      matchDuration
+    ]);
+    
+    // Update user stats
+    for (const player of players) {
+      const isWinner = winner && winner.userId === player.userId;
+      await dbPool.execute(`
+        UPDATE users SET 
+          games_played = games_played + 1,
+          games_won = games_won + ?,
+          total_score = total_score + ?
+        WHERE id = ?
+      `, [isWinner ? 1 : 0, player.score, player.userId]);
     }
-  } catch(error) {
-    console.error('Database error:', error);
+    
+    console.log(`✅ Match result saved for room ${gameState.roomId}`);
+  } catch (error) {
+    console.error('❌ Failed to save match result:', error);
   }
 }
 
 // API Routes
-app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Math Battle API</title>
-        <style>
-            body { font-family: Arial; background: #0a0a0a; color: #fff; text-align: center; padding: 50px; }
-            .status { color: #00ff88; font-size: 24px; margin: 20px 0; }
-            .info { background: #111; padding: 20px; border-radius: 10px; margin: 20px 0; }
-        </style>
-    </head>
-    <body>
-        <h1>🚀 Math Battle Server</h1>
-        <div class="status">✅ Server is Running!</div>
-        <div class="info">
-            <h3>API Status</h3>
-            <p>Queue: ${waitingQueue.size} players waiting</p>
-            <p>Active Matches: ${activeMatches.size}</p>
-            <p>Connected Players: ${playerSockets.size}</p>
-        </div>
-        <div class="info">
-            <h3>Endpoints</h3>
-            <p>GET /health - Health check</p>
-            <p>GET /api/leaderboard - Top players</p>
-            <p>WebSocket - Real-time game events</p>
-        </div>
-    </body>
-    </html>
-  `);
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    queue: waitingQueue.size,
-    matches: activeMatches.size,
-    players: playerSockets.size
-  });
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username } = req.body;
+    
+    if (!username || username.length < 2) {
+      return res.status(400).json({ error: 'Username must be at least 2 characters' });
+    }
+    
+    // Get or create user
+    let [users] = await dbPool.execute('SELECT * FROM users WHERE username = ?', [username]);
+    let user;
+    
+    if (users.length === 0) {
+      const [result] = await dbPool.execute(
+        'INSERT INTO users (username) VALUES (?)', 
+        [username]
+      );
+      user = { id: result.insertId, username, games_played: 0, games_won: 0, total_score: 0 };
+    } else {
+      user = users[0];
+    }
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user.id, username: user.username },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+    
+    res.json({ 
+      success: true, 
+      user,
+      token 
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 app.get('/api/leaderboard', async (req, res) => {
   try {
-    const [rows] = await db.execute(`
-      SELECT username, wins, total_games, total_score, 
-             ROUND((wins / GREATEST(total_games, 1)) * 100, 1) as win_rate
-      FROM math_players 
-      WHERE total_games > 0
-      ORDER BY wins DESC, total_score DESC 
+    const [users] = await dbPool.execute(`
+      SELECT username, games_played, games_won, total_score,
+             ROUND((games_won / GREATEST(games_played, 1)) * 100, 1) as win_rate
+      FROM users 
+      WHERE games_played > 0
+      ORDER BY total_score DESC, win_rate DESC
       LIMIT 10
     `);
-    res.json({ success: true, leaderboard: rows });
-  } catch(error) {
-    res.json({ success: false, error: 'Database error' });
+    
+    res.json(users);
+  } catch (error) {
+    console.error('Leaderboard error:', error);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Socket.IO Events
+// Socket.IO connection handling
 io.on('connection', (socket) => {
-  console.log(`👤 Player connected: ${socket.id}`);
-
-  socket.on('joinQueue', async (data) => {
-    const { username } = data;
-    if(!username || username.trim().length === 0) {
-      socket.emit('error', { message: 'Username required' });
+  console.log(`🔗 Player connected: ${socket.id}`);
+  
+  socket.on('authenticate', (token) => {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      socket.userId = decoded.userId;
+      socket.username = decoded.username;
+      socket.authenticated = true;
+      playerSockets.set(socket.userId, socket);
+      
+      socket.emit('authenticated', { 
+        userId: decoded.userId, 
+        username: decoded.username 
+      });
+      
+      console.log(`✅ Player authenticated: ${socket.username} (${socket.userId})`);
+    } catch (error) {
+      socket.emit('authError', { message: 'Invalid token' });
+      console.log(`❌ Authentication failed for socket: ${socket.id}`);
+    }
+  });
+  
+  socket.on('joinQueue', () => {
+    if (!socket.authenticated) {
+      return socket.emit('error', { message: 'Please authenticate first' });
+    }
+    
+    // Check if player is already in queue or in game
+    if (waitingQueue.find(p => p.userId === socket.userId) || socket.roomId) {
+      return socket.emit('error', { message: 'Already in queue or in game' });
+    }
+    
+    // Add to queue
+    waitingQueue.push(socket);
+    socket.emit('queueJoined', { position: waitingQueue.length });
+    
+    console.log(`🎯 ${socket.username} joined queue (${waitingQueue.length} waiting)`);
+    
+    // Try to match players
+    if (waitingQueue.length >= 2) {
+      const player1 = waitingQueue.shift();
+      const player2 = waitingQueue.shift();
+      
+      if (player1.connected && player2.connected) {
+        const gameState = createGameRoom(player1, player2);
+        
+        // Emit match found
+        io.to(gameState.roomId).emit('matchFound', {
+          roomId: gameState.roomId,
+          opponent: {
+            [player1.id]: { username: player2.username },
+            [player2.id]: { username: player1.username }
+          },
+          countdown: 5
+        });
+        
+        console.log(`🎮 Match created: ${player1.username} vs ${player2.username}`);
+        
+        // Start countdown
+        setTimeout(() => {
+          if (gameRooms.has(gameState.roomId)) {
+            startGame(gameState);
+          }
+        }, 5000);
+      }
+    }
+  });
+  
+  socket.on('leaveQueue', () => {
+    const index = waitingQueue.findIndex(p => p.userId === socket.userId);
+    if (index !== -1) {
+      waitingQueue.splice(index, 1);
+      socket.emit('queueLeft');
+      console.log(`❌ ${socket.username} left queue`);
+    }
+  });
+  
+  socket.on('playerReady', () => {
+    const roomId = socket.roomId;
+    if (!roomId || !gameRooms.has(roomId)) return;
+    
+    const gameState = gameRooms.get(roomId);
+    if (gameState.players[socket.id]) {
+      gameState.players[socket.id].ready = true;
+      
+      // Check if both players are ready
+      const players = Object.values(gameState.players);
+      if (players.every(p => p.ready)) {
+        startGame(gameState);
+      }
+    }
+  });
+  
+  socket.on('submitAnswer', (data) => {
+    const roomId = socket.roomId;
+    if (!roomId || !gameRooms.has(roomId)) return;
+    
+    const gameState = gameRooms.get(roomId);
+    const player = gameState.players[socket.id];
+    
+    if (!player || !player.currentQuestion || player.answered || gameState.gameEnded) {
       return;
     }
-
-    const playerId = uuidv4();
-    const playerData = {
-      id: playerId,
-      socketId: socket.id,
-      username: username.trim().substring(0, 20),
-      joinedAt: Date.now()
-    };
-
-    // Create/update player in database
-    await createOrUpdatePlayer(playerId, playerData.username);
     
-    playerSockets.set(playerId, socket.id);
-    socket.playerId = playerId;
-
-    // Check if anyone waiting
-    if(waitingQueue.size === 0) {
-      waitingQueue.set(playerId, playerData);
-      socket.emit('queueJoined', { position: 1 });
-      console.log(`📝 ${username} joined queue`);
-    } else {
-      // Match found!
-      const [opponentId, opponentData] = waitingQueue.entries().next().value;
-      waitingQueue.delete(opponentId);
-
-      const matchId = uuidv4();
-      const matchData = {
-        id: matchId,
-        player1: playerData,
-        player2: opponentData,
-        scores: { [playerId]: 0, [opponentId]: 0 },
-        questions: { [playerId]: null, [opponentId]: null },
-        startTime: null,
-        endTime: null,
-        gameTimer: null,
-        duration: 120000 // 2 minutes
-      };
-
-      activeMatches.set(matchId, matchData);
-
-      // Join both to match room
-      socket.join(matchId);
-      const opponentSocket = io.sockets.sockets.get(opponentData.socketId);
-      if(opponentSocket) {
-        opponentSocket.join(matchId);
-      }
-
-      // Notify both players
-      io.to(matchId).emit('matchFound', {
-        matchId: matchId,
-        opponent: playerId === playerData.id ? opponentData.username : playerData.username,
-        countdown: 5
-      });
-
-      console.log(`⚔️ Match created: ${playerData.username} vs ${opponentData.username}`);
-
-      // Start match after countdown
-      setTimeout(() => {
-        startMatch(matchId);
-      }, 5000);
+    player.answered = true;
+    const isCorrect = data.answer === player.currentQuestion.correctAnswer;
+    
+    if (isCorrect) {
+      const timeBonus = Math.max(0, 30 - Math.floor((Date.now() - player.questionStartTime) / 1000));
+      player.score += 10 + timeBonus;
     }
-  });
-
-  socket.on('submitAnswer', (data) => {
-    const { matchId, answer, questionId } = data;
-    const playerId = socket.playerId;
-
-    if(!playerId || !activeMatches.has(matchId)) return;
-
-    const match = activeMatches.get(matchId);
-    const question = match.questions[playerId];
-
-    if(!question || question.id !== questionId) return;
-
-    // Check answer
-    const isCorrect = answer === question.correct;
-    if(isCorrect) {
-      match.scores[playerId] += 10; // 10 points per correct answer
-    }
-
-    // Send new question
-    const newQuestion = generateMathQuestion();
-    newQuestion.id = uuidv4();
-    match.questions[playerId] = newQuestion;
-
+    
+    // Send new question immediately to this player
+    const newQuestion = generateQuestion();
+    player.currentQuestion = newQuestion;
+    player.questionStartTime = Date.now();
+    player.answered = false;
+    
+    socket.emit('questionResult', {
+      correct: isCorrect,
+      correctAnswer: player.currentQuestion.correctAnswer,
+      score: player.score
+    });
+    
     socket.emit('newQuestion', {
       question: newQuestion,
-      isCorrect: isCorrect,
-      score: match.scores[playerId]
+      timeLimit: 30
     });
-
-    // Update scores to room
-    io.to(matchId).emit('scoreUpdate', {
-      scores: match.scores,
-      playerNames: {
-        [match.player1.id]: match.player1.username,
-        [match.player2.id]: match.player2.username
-      }
+    
+    // Broadcast scores to room
+    const scores = {};
+    Object.values(gameState.players).forEach(p => {
+      scores[p.username] = p.score;
     });
+    
+    io.to(roomId).emit('scoreUpdate', scores);
   });
-
-  // WebRTC Signaling for Voice Chat
-  socket.on('voice-offer', (data) => {
-    socket.to(data.matchId).emit('voice-offer', {
-      offer: data.offer,
-      from: socket.playerId
-    });
+  
+  // WebRTC signaling
+  socket.on('rtc-offer', (data) => {
+    socket.to(socket.roomId).emit('rtc-offer', data);
   });
-
-  socket.on('voice-answer', (data) => {
-    socket.to(data.matchId).emit('voice-answer', {
-      answer: data.answer,
-      from: socket.playerId
-    });
+  
+  socket.on('rtc-answer', (data) => {
+    socket.to(socket.roomId).emit('rtc-answer', data);
   });
-
-  socket.on('ice-candidate', (data) => {
-    socket.to(data.matchId).emit('ice-candidate', {
-      candidate: data.candidate,
-      from: socket.playerId
-    });
+  
+  socket.on('rtc-ice-candidate', (data) => {
+    socket.to(socket.roomId).emit('rtc-ice-candidate', data);
   });
-
+  
   socket.on('disconnect', () => {
-    const playerId = socket.playerId;
-    if(playerId) {
-      waitingQueue.delete(playerId);
-      playerSockets.delete(playerId);
-      
-      // Handle active match disconnect
-      for(const [matchId, match] of activeMatches.entries()) {
-        if(match.player1.id === playerId || match.player2.id === playerId) {
-          socket.to(matchId).emit('opponentDisconnected');
-          endMatch(matchId, true);
-          break;
-        }
-      }
+    console.log(`❌ Player disconnected: ${socket.id}`);
+    
+    // Remove from queue
+    const queueIndex = waitingQueue.findIndex(p => p.id === socket.id);
+    if (queueIndex !== -1) {
+      waitingQueue.splice(queueIndex, 1);
     }
-    console.log(`👋 Player disconnected: ${socket.id}`);
+    
+    // Handle game room cleanup
+    if (socket.roomId && gameRooms.has(socket.roomId)) {
+      const gameState = gameRooms.get(socket.roomId);
+      
+      // Notify opponent
+      socket.to(socket.roomId).emit('opponentDisconnected');
+      
+      // End game and save results if game was in progress
+      if (gameState.gameStarted && !gameState.gameEnded) {
+        endGame(gameState);
+      }
+      
+      // Clean up room after delay
+      setTimeout(() => {
+        gameRooms.delete(socket.roomId);
+      }, 5000);
+    }
+    
+    // Remove from player sockets
+    if (socket.userId) {
+      playerSockets.delete(socket.userId);
+    }
   });
 });
 
-function startMatch(matchId) {
-  if(!activeMatches.has(matchId)) return;
-
-  const match = activeMatches.get(matchId);
-  match.startTime = Date.now();
-
-  // Generate first questions for both players
-  const q1 = generateMathQuestion();
-  const q2 = generateMathQuestion();
-  q1.id = uuidv4();
-  q2.id = uuidv4();
-
-  match.questions[match.player1.id] = q1;
-  match.questions[match.player2.id] = q2;
-
-  // Send to players
-  const p1Socket = io.sockets.sockets.get(match.player1.socketId);
-  const p2Socket = io.sockets.sockets.get(match.player2.socketId);
-
-  if(p1Socket) p1Socket.emit('gameStart', { question: q1, timeLeft: 120 });
-  if(p2Socket) p2Socket.emit('gameStart', { question: q2, timeLeft: 120 });
-
-  console.log(`🎮 Match started: ${matchId}`);
-
+function startGame(gameState) {
+  gameState.gameStarted = true;
+  gameState.startTime = Date.now();
+  
+  // Send initial questions to both players
+  Object.values(gameState.players).forEach(player => {
+    const question = generateQuestion();
+    player.currentQuestion = question;
+    player.questionStartTime = Date.now();
+    player.answered = false;
+    
+    player.socket.emit('gameStart', {
+      question,
+      duration: gameState.duration
+    });
+  });
+  
+  console.log(`🚀 Game started in room ${gameState.roomId}`);
+  
   // Set game timer
-  match.gameTimer = setTimeout(() => {
-    endMatch(matchId, false);
-  }, match.duration);
+  gameState.timer = setTimeout(() => {
+    endGame(gameState);
+  }, gameState.duration * 1000);
 }
 
-async function endMatch(matchId, disconnected = false) {
-  if(!activeMatches.has(matchId)) return;
-
-  const match = activeMatches.get(matchId);
-  match.endTime = Date.now();
-
-  if(match.gameTimer) {
-    clearTimeout(match.gameTimer);
+function endGame(gameState) {
+  if (gameState.gameEnded) return;
+  
+  gameState.gameEnded = true;
+  
+  if (gameState.timer) {
+    clearTimeout(gameState.timer);
   }
-
-  const p1Score = match.scores[match.player1.id] || 0;
-  const p2Score = match.scores[match.player2.id] || 0;
-
-  let winnerId = null;
-  if(p1Score > p2Score) winnerId = match.player1.id;
-  else if(p2Score > p1Score) winnerId = match.player2.id;
-
-  // Save match to database
-  try {
-    await db.execute(`
-      INSERT INTO math_matches (id, player1_id, player2_id, player1_score, player2_score, winner_id)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `, [matchId, match.player1.id, match.player2.id, p1Score, p2Score, winnerId]);
-
-    // Update player stats
-    if(winnerId) {
-      await updatePlayerStats(winnerId, true, winnerId === match.player1.id ? p1Score : p2Score);
-      const loserId = winnerId === match.player1.id ? match.player2.id : match.player1.id;
-      await updatePlayerStats(loserId, false, loserId === match.player1.id ? p1Score : p2Score);
+  
+  const players = Object.values(gameState.players);
+  const finalScores = {};
+  let winner = null;
+  let maxScore = -1;
+  
+  players.forEach(player => {
+    finalScores[player.username] = player.score;
+    if (player.score > maxScore) {
+      maxScore = player.score;
+      winner = player.username;
+    } else if (player.score === maxScore && maxScore > 0) {
+      winner = 'Draw';
     }
-  } catch(error) {
-    console.error('Database error saving match:', error);
-  }
-
-  // Send results
-  const results = {
-    matchId: matchId,
-    scores: match.scores,
-    winner: winnerId,
-    disconnected: disconnected,
-    duration: match.endTime - match.startTime
-  };
-
-  io.to(matchId).emit('gameEnd', results);
-
-  console.log(`🏁 Match ended: ${matchId}, Winner: ${winnerId || 'Draw'}`);
-
+  });
+  
+  // Emit game results
+  io.to(gameState.roomId).emit('gameEnd', {
+    winner,
+    finalScores,
+    duration: gameState.startTime ? Math.floor((Date.now() - gameState.startTime) / 1000) : 0
+  });
+  
+  console.log(`🏁 Game ended in room ${gameState.roomId}. Winner: ${winner}`);
+  
+  // Save match result
+  saveMatchResult(gameState);
+  
   // Cleanup
-  activeMatches.delete(matchId);
+  setTimeout(() => {
+    gameRooms.delete(gameState.roomId);
+  }, 10000);
 }
 
-// Health check interval
-setInterval(() => {
-  console.log(`📊 Status - Queue: ${waitingQueue.size}, Matches: ${activeMatches.size}, Players: ${playerSockets.size}`);
-}, 30000);
-
+// Start server
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Math Battle Server running on port ${PORT}`);
-  console.log(`📡 Socket.IO ready for real-time connections`);
-  console.log(`🎮 Game ready to battle!`);
+
+initDatabase().then(() => {
+  server.listen(PORT, () => {
+    console.log(`🚀 Math Battle Server running on port ${PORT}`);
+  });
 });
