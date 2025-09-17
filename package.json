@@ -1,7 +1,7 @@
 {
-  "name": "quiz-battle-backend",
+  "name": "math-battle-game",
   "version": "1.0.0",
-  "description": "Realtime Quiz Battle Game Backend",
+  "description": "Real-time Math Battle Game with Voice Chat",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -10,20 +10,25 @@
   "dependencies": {
     "express": "^4.18.2",
     "socket.io": "^4.7.2",
-    "cors": "^2.8.5"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0",
+    "express-rate-limit": "^6.10.0",
+    "mysql2": "^3.6.0",
+    "dotenv": "^16.3.1",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "uuid": "^9.0.0"
   },
   "engines": {
     "node": ">=16.0.0"
   },
   "keywords": [
-    "quiz",
+    "math",
+    "game",
     "realtime",
-    "websocket",
-    "game"
+    "socket.io",
+    "voice-chat"
   ],
-  "author": "Quiz Battle Team",
+  "author": "CashEarnersOfficial",
   "license": "MIT"
 }
